@@ -1,0 +1,14 @@
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# Secretos: NUNCA subas claves a GitHub
+.env
+.streamlit/secrets.toml
+
+# Resultados y datos descargados (no se suben)
+*.xlsx
+*.csv
+.ipynb_checkpoints/
