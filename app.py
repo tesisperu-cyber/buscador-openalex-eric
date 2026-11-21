@@ -315,37 +315,66 @@ def buscar_por_titulo(titulo, anio, auth, umbral=0.90):
 
 # ---------------------------------------------------------------- ERIC
 def _variantes_eric(q, a, b):
-    base = q
+    """Formas de pedir el rango de años a ERIC: (texto de búsqueda, parámetros extra, filtrar años después)."""
     if a and b:
-        yield f"{base} AND publicationdateyear:{a}-{b}"
-        yield f"{base} AND publicationdateyear:[{a} TO {b}]"
+        yield f"{q} AND publicationdateyear:{a}-{b}", {}, False
+        yield f"{q} AND publicationdateyear:[{a} TO {b}]", {}, False
+        yield q, {"publicationdatestart": f"{a}-01-01", "publicationdateend": f"{b}-12-31"}, True
     else:
-        yield base
+        yield q, {}, False
+
+
+def _respuesta_eric(r):
+    """Devuelve (response, explicación). Si ERIC no trajo el campo 'response', explica qué trajo."""
+    try:
+        j = r.json()
+    except ValueError:
+        return None, "la respuesta no era JSON"
+    resp = j.get("response") if isinstance(j, dict) else None
+    if isinstance(resp, dict):
+        return resp, None
+    return None, "sin el campo 'response': " + str(j)[:200]
 
 
 def buscar_eric(q, a, b, max_registros=500, por_pagina=100, log=_log_print):
     """Busca en ERIC. Devuelve (ecuación_usada, total_en_eric, lista_de_registros)."""
-    for v in _variantes_eric(q, a, b):
-        r = _get(ERIC_URL, {"search": v, "format": "json", "rows": min(por_pagina, max_registros),
-                            "start": 0}, timeout=60)
+    problemas, hubo_respuesta_valida = [], False
+    for v, extra, filtrar_anios in _variantes_eric(q, a, b):
+        def pedir(inicio, filas):
+            p = {"search": v, "format": "json", "rows": filas, "start": inicio}
+            p.update(extra)
+            return _get(ERIC_URL, p, timeout=60)
+
+        r = pedir(0, min(por_pagina, max_registros))
         if r.status_code != 200:
+            problemas.append(f"HTTP {r.status_code}")
             log(f"ERIC no aceptó esta forma de la ecuación (HTTP {r.status_code}); pruebo otra.")
             continue
-        resp = r.json()["response"]
+        resp, falla = _respuesta_eric(r)
+        if resp is None:
+            problemas.append(falla)
+            log(f"ERIC respondió {falla}; pruebo otra forma.")
+            continue
+        hubo_respuesta_valida = True
         total = resp.get("numFound", 0)
         log(f"ERIC: {total:,} resultados en total.")
         if total > 0:
-            docs = list(resp["docs"])
+            docs = list(resp.get("docs") or [])
             while len(docs) < min(total, max_registros):
-                r2 = _get(ERIC_URL, {"search": v, "format": "json",
-                                     "rows": min(por_pagina, max_registros - len(docs)),
-                                     "start": len(docs)}, timeout=60)
-                nuevo = r2.json()["response"]["docs"] if r2.status_code == 200 else []
+                r2 = pedir(len(docs), min(por_pagina, max_registros - len(docs)))
+                resp2, _ = _respuesta_eric(r2) if r2.status_code == 200 else (None, None)
+                nuevo = (resp2 or {}).get("docs") or []
                 if not nuevo:
                     break
                 docs += nuevo
                 time.sleep(0.5)
+            if filtrar_anios:
+                docs = [d for d in docs if str(d.get("publicationdateyear", "")).isdigit()
+                        and a <= int(d["publicationdateyear"]) <= b]
             return v, total, docs[:max_registros]
+    if not hubo_respuesta_valida:
+        raise ErrorBusqueda("ERIC no devolvió una respuesta válida (" + "; ".join(dict.fromkeys(problemas))
+                            + "). Prueba de nuevo en unos minutos, simplifica la ecuación o desmarca ERIC.")
     return None, 0, []
 
 
@@ -464,6 +493,13 @@ def aplicar_sjr(fila, sjr, anio):
     return fila
 
 
+def _mensaje_error(e, auth):
+    """Texto del error apto para mostrar: sin claves ni correo, y con el tipo si es inesperado."""
+    if isinstance(e, ErrorBusqueda):
+        return ocultar(e, auth["api_key"], auth["email"])
+    return ocultar(f"error inesperado ({type(e).__name__}): {e}", auth["api_key"], auth["email"])
+
+
 # ---------------------------------------------------------------- búsqueda completa
 def ejecutar_busqueda(ecuacion, anio_desde=None, anio_hasta=None, email="", api_key="",
                       usar_openalex=True, usar_eric=True, max_openalex=500, max_eric=500,
@@ -513,9 +549,10 @@ def ejecutar_busqueda(ecuacion, anio_desde=None, anio_hasta=None, email="", api_
                               "(los más citados). Sube el tope si quieres más.")
             if total == 0:
                 avisos.append("OpenAlex devolvió 0 resultados: revisa la ecuación.")
-        except ErrorBusqueda as e:
-            errores_fuente.append(f"OpenAlex: {e}")
-            log(f"⚠️ OpenAlex falló: {e}")
+        except Exception as e:                    # una fuente que falle no tumba a la otra
+            msg = _mensaje_error(e, auth)
+            errores_fuente.append(f"OpenAlex: {msg}")
+            log(f"⚠️ OpenAlex falló: {msg}")
 
     # --- ERIC ---
     docs = []
@@ -527,9 +564,10 @@ def ejecutar_busqueda(ecuacion, anio_desde=None, anio_hasta=None, email="", api_
             log(f"ERIC: {len(docs):,} registros descargados.", 0.65)
             if total > max_eric:
                 avisos.append(f"ERIC tiene {total:,} resultados; se descargaron {max_eric:,}.")
-        except ErrorBusqueda as e:
-            errores_fuente.append(f"ERIC: {e}")
-            log(f"⚠️ ERIC falló: {e}")
+        except Exception as e:
+            msg = _mensaje_error(e, auth)
+            errores_fuente.append(f"ERIC: {msg}")
+            log(f"⚠️ ERIC falló: {msg}")
 
     if errores_fuente and not filas and not docs:
         raise ErrorBusqueda(" | ".join(errores_fuente))
